@@ -744,3 +744,350 @@ def test_admission_evaluated_against_single_snapshot(client):
     entries = resp.json()["admission"]["entries"]
     assert entries[0]["segments"][0]["resolution"]["version_id"] == "v1"
     assert entries[1]["segments"][0]["version_id"] == "v2"
+
+
+# -- verbatim (as-registered) version references ---------------------------
+
+
+def _entry_verbatim(kind, ref, use, verbatim):
+    return {"kind": kind, "ref": ref, "use": use, "verbatim_ref": verbatim}
+
+
+def _setup_spaced_versions(client):
+    """Two distinct registered ids: ' v ' (licensed) and 'v' (unlicensed)."""
+    _version(client, " v ")
+    _version(client, "v")
+    _change(client, "lc-spaced", " v ", _iso(2026, 1, 1), ["research"])
+
+
+def test_verbatim_version_ref_quotes_registered_id_with_spaces(client):
+    _setup_spaced_versions(client)
+    resp = _admit(
+        client,
+        "del-spaced",
+        _iso(2026, 2, 1),
+        _iso(2026, 8, 1),
+        [_entry_verbatim("version", " v ", "research", True)],
+    )
+    assert resp.status_code == 201, resp.text
+    entry = resp.json()["admission"]["entries"][0]
+    assert entry["ref"] == " v "
+    assert entry["verbatim_ref"] is True
+    segment = entry["segments"][0]
+    assert segment["allowed"] is True
+    assert segment["version_id"] == " v "
+    assert segment["resolution"]["ref"] == " v "
+    assert segment["resolution"]["version_id"] == " v "
+    assert segment["closure"] == [" v "]
+    assert segment["basis"][0]["change_id"] == "lc-spaced"
+
+
+def test_without_verbatim_spaces_are_trimmed_to_other_version(client):
+    _setup_spaced_versions(client)
+    # Default rule: ' v ' resolves to the distinct registered id 'v', which
+    # has no license at all -> 403 no_valid_license rather than admitting the
+    # licensed ' v ' or reporting the spaced id as unknown.
+    resp = _admit(
+        client,
+        "del-trim",
+        _iso(2026, 2, 1),
+        _iso(2026, 8, 1),
+        [_entry("version", " v ", "research")],
+    )
+    assert resp.status_code == 403
+    failure = resp.json()["failures"][0]
+    assert failure["ref"] == "v"
+    assert failure["verbatim_ref"] is False
+    assert failure["reason"] == "no_valid_license"
+    assert failure["blockers"][0]["version_id"] == "v"
+
+
+def test_verbatim_unknown_spaced_id_is_404_not_trimmed_guess(client):
+    _version(client, "v")
+    resp = _admit(
+        client,
+        "del-x",
+        _iso(2026, 2, 1),
+        _iso(2026, 8, 1),
+        [_entry_verbatim("version", " v ", "research", True)],
+    )
+    # ' v ' is not registered even though trimmed 'v' is: never guess.
+    assert resp.status_code == 404
+    assert " v " in resp.json()["details"]["missing_version_ids"]
+    assert client.get("/delivery-admissions/del-x").status_code == 404
+
+
+def test_verbatim_denial_is_not_persisted_and_id_can_retry(client):
+    _version(client, " v ")
+    resp = _admit(
+        client,
+        "del-spaced-deny",
+        _iso(2026, 2, 1),
+        _iso(2026, 8, 1),
+        [_entry_verbatim("version", " v ", "research", True)],
+    )
+    assert resp.status_code == 403
+    failure = resp.json()["failures"][0]
+    assert failure["ref"] == " v "
+    assert failure["verbatim_ref"] is True
+    assert failure["reason"] == "no_valid_license"
+    assert failure["blockers"][0]["version_id"] == " v "
+    assert client.get("/delivery-admissions/del-spaced-deny").status_code == 404
+    # After the license is registered, the same delivery id can freeze.
+    _change(client, "lc-spaced", " v ", _iso(2026, 1, 1), ["research"])
+    retry = _admit(
+        client,
+        "del-spaced-deny",
+        _iso(2026, 2, 1),
+        _iso(2026, 8, 1),
+        [_entry_verbatim("version", " v ", "research", True)],
+    )
+    assert retry.status_code == 201
+
+
+def test_verbatim_replay_requires_same_quoting_mode_and_actual_id(client):
+    _setup_spaced_versions(client)
+    window = (_iso(2026, 2, 1), _iso(2026, 8, 1))
+    first = _admit(
+        client, "del-1", *window,
+        [_entry_verbatim("version", " v ", "research", True)],
+    )
+    assert first.status_code == 201
+
+    # Identical quoting mode + actual id (use spacing still trims) -> replay.
+    retry = _admit(
+        client, "del-1", *window,
+        [_entry_verbatim("version", " v ", " research ", True)],
+    )
+    assert retry.status_code == 200
+    assert retry.json()["replayed"] is True
+    assert retry.json()["admission"] == first.json()["admission"]
+
+    # Toggling the quoting mode changes the actual referenced id ('v') -> 409.
+    conflict_mode = _admit(
+        client, "del-1", *window,
+        [_entry("version", " v ", "research")],
+    )
+    assert conflict_mode.status_code == 409
+
+    # Same mode but a different actual id ('v' quoted verbatim) -> 409.
+    conflict_id = _admit(
+        client, "del-1", *window,
+        [_entry_verbatim("version", "v", "research", True)],
+    )
+    assert conflict_id.status_code == 409
+
+    # First record is untouched and remains queryable with its original replay.
+    got = client.get("/delivery-admissions/del-1")
+    assert got.status_code == 200
+    assert got.json() == first.json()["admission"]
+
+
+def test_frozen_verbatim_admission_is_immutable(client):
+    _setup_spaced_versions(client)
+    first = _admit(
+        client,
+        "del-imm",
+        _iso(2026, 2, 1),
+        _iso(2026, 8, 1),
+        [_entry_verbatim("version", " v ", "research", True)],
+    )
+    assert first.status_code == 201
+    # Catalog changes afterwards (including revoking the basis) never rewrite
+    # the frozen verbatim record.
+    client.post(
+        "/license-changes/revocations",
+        json={"change_id": "lc-spaced", "revocation_id": "r1", "reason": "x"},
+    )
+    got = client.get("/delivery-admissions/del-imm").json()
+    assert got == first.json()["admission"]
+    assert got["entries"][0]["ref"] == " v "
+    assert got["entries"][0]["verbatim_ref"] is True
+    assert got["entries"][0]["segments"][0]["allowed"] is True
+
+
+def test_verbatim_blank_ref_is_422(client):
+    _setup_spaced_versions(client)
+    resp = _admit(
+        client,
+        "del-blank",
+        _iso(2026, 2, 1),
+        _iso(2026, 8, 1),
+        [_entry_verbatim("version", "   ", "research", True)],
+    )
+    assert resp.status_code == 422
+    assert client.get("/delivery-admissions/del-blank").status_code == 404
+
+
+def test_slot_entry_ignores_verbatim_flag_and_keeps_trimming(client):
+    # The slot is registered under the trimmed name 'p' pointing at ' v '.
+    _version(client, " v ")
+    _change(client, "lc-spaced", " v ", _iso(2026, 1, 1), ["research"])
+    assert _publish(
+        client, "rel-1", _iso(2026, 1, 1), "p", " v ", 0
+    ).status_code == 201
+    resp = _admit(
+        client,
+        "del-slot",
+        _iso(2026, 2, 1),
+        _iso(2026, 8, 1),
+        [_entry_verbatim("slot", " p ", "research", True)],
+    )
+    assert resp.status_code == 201, resp.text
+    entry = resp.json()["admission"]["entries"][0]
+    assert entry["ref"] == "p"
+    assert entry["verbatim_ref"] is False
+    assert entry["segments"][0]["version_id"] == " v "
+    # A replay without the flag is the same slot content (still trimmed).
+    retry = _admit(
+        client,
+        "del-slot",
+        _iso(2026, 2, 1),
+        _iso(2026, 8, 1),
+        [_entry("slot", "p", "research")],
+    )
+    assert retry.status_code == 200
+    assert retry.json()["replayed"] is True
+
+
+def test_verbatim_flag_part_of_ordered_manifest_conflict(client):
+    _setup_spaced_versions(client)
+    # 'v' is licensed too, so both entries can pass; the conflict below must
+    # come only from the changed quoting mode, not from a denied manifest.
+    _change(client, "lc-plain", "v", _iso(2026, 1, 1), ["research"])
+    window = (_iso(2026, 2, 1), _iso(2026, 8, 1))
+    assert _admit(
+        client, "del-multi", *window,
+        [
+            _entry_verbatim("version", " v ", "research", True),
+            _entry("version", "v", "research"),
+        ],
+    ).status_code == 201
+    # Same ids, same order, but the second entry also switches to verbatim:
+    # quoting mode differs -> 409.
+    resp = _admit(
+        client, "del-multi", *window,
+        [
+            _entry_verbatim("version", " v ", "research", True),
+            _entry_verbatim("version", "v", "research", True),
+        ],
+    )
+    assert resp.status_code == 409
+
+
+# -- legacy records frozen before verbatim quoting existed ------------------
+
+
+def _insert_legacy_admission_row(db, *, delivery_id, start, end, ref, use):
+    """Write a row exactly as the pre-verbatim build would have frozen it."""
+    import hashlib
+    import json
+
+    created = start.replace("Z", ".000000Z")
+    end_c = end.replace("Z", ".000000Z")
+    result = {
+        "delivery_id": delivery_id,
+        "created_at": created,
+        "start": created,
+        "end": end_c,
+        "entry_count": 1,
+        "entries": [
+            {
+                "position": 0,
+                "kind": "version",
+                "ref": ref,
+                "use": use,
+                # NOTE: no verbatim_ref key, as in records frozen pre-upgrade.
+                "resolution": {
+                    "kind": "version", "ref": ref, "version_id": ref,
+                    "release_id": None, "revision": None,
+                    "effective_at": created,
+                },
+                "segments": [
+                    {
+                        "start": created,
+                        "end": end_c,
+                        "allowed": True,
+                        "resolution": {
+                            "kind": "version", "ref": ref, "version_id": ref,
+                            "release_id": None, "revision": None,
+                            "effective_at": created,
+                        },
+                        "version_id": ref,
+                        "closure": [ref],
+                        "basis": [],
+                        "blockers": [],
+                        "allowed_uses_intersection": [use],
+                    }
+                ],
+            }
+        ],
+    }
+    result_json = json.dumps(result, ensure_ascii=False, sort_keys=True)
+    # Legacy hash payload carried no verbatim_ref term.
+    payload = {
+        "start": created,
+        "end": end_c,
+        "entries": [{"position": 0, "kind": "version", "ref": ref, "use": use}],
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    db.execute(
+        "INSERT INTO delivery_admissions "
+        "(delivery_id, content_hash, start_value, end_value, created_at, result_json) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (delivery_id, digest, created, end_c, created, result_json),
+    )
+
+
+def test_legacy_frozen_record_still_replays_after_upgrade(client):
+    db = client.app.state.app_state.db
+    _insert_legacy_admission_row(
+        db,
+        delivery_id="del-legacy",
+        start=_iso(2026, 2, 1),
+        end=_iso(2026, 8, 1),
+        ref="a",
+        use="research",
+    )
+    # GET keeps working and the absent flag is reported as the legacy rule.
+    got = client.get("/delivery-admissions/del-legacy")
+    assert got.status_code == 200
+    legacy_body = got.json()
+    assert legacy_body["entries"][0]["verbatim_ref"] is False
+
+    # Same input as the legacy record (default trimmed quoting) replays it,
+    # even though the new hash scheme would otherwise differ.
+    retry = _admit(
+        client,
+        "del-legacy",
+        _iso(2026, 2, 1),
+        _iso(2026, 8, 1),
+        [_entry("version", " a ", " research ")],
+    )
+    assert retry.status_code == 200
+    assert retry.json()["replayed"] is True
+    assert retry.json()["admission"] == legacy_body
+
+    # Different content against the same legacy id still conflicts.
+    conflict = _admit(
+        client,
+        "del-legacy",
+        _iso(2026, 2, 1),
+        _iso(2026, 9, 1),
+        [_entry("version", "a", "research")],
+    )
+    assert conflict.status_code == 409
+    # Switching to verbatim quoting is likewise a different request.
+    conflict_mode = _admit(
+        client,
+        "del-legacy",
+        _iso(2026, 2, 1),
+        _iso(2026, 8, 1),
+        [_entry_verbatim("version", "a", "research", True)],
+    )
+    assert conflict_mode.status_code == 409
+

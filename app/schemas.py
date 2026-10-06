@@ -231,18 +231,38 @@ class DeliveryAdmissionEntryRequest(BaseModel):
     ref: str = Field(
         min_length=1,
         description=(
-            "版本标识或槽名（去首尾空格后非空）；kind=version 时必须已登记，"
-            "kind=slot 时须在窗口起点前（含起点）已发布，否则该条失败"
+            "版本标识或槽名（去首尾空格后非空）。kind=slot 时一律先去首尾空格，"
+            "槽名按发布登记的去空格名解析；kind=version 默认同样去首尾空格，"
+            "仅当显式 verbatim_ref=true 时按提交原样引用（保留首尾空格）已登记版本标识，"
+            "原样标识不存在即按未知版本拒绝。空白引用一律 422"
         ),
     )
     use: str = Field(min_length=1, description="该条交付的拟使用用途（去首尾空格后判定与留痕）")
+    verbatim_ref: bool = Field(
+        default=False,
+        description=(
+            "是否按提交原样引用已登记版本标识（保留首尾空格）。仅 kind=version 有效；"
+            "槽条目始终沿用去首尾空格规则，提交 true 也不生效（按 false 处理）。"
+            "未选择（false）时版本与槽引用都继续沿用现有去首尾空格规则"
+        ),
+    )
 
-    @field_validator("ref", "use")
+    @field_validator("ref")
     @classmethod
-    def _non_blank(cls, value: str) -> str:
+    def _ref_non_blank(cls, value: str) -> str:
+        # Keep the submitted characters verbatim (including surrounding spaces):
+        # the service decides per entry whether to trim or to quote as-is. Only
+        # an all-whitespace reference is rejected here, matching the 422 rule.
+        if not value.strip():
+            raise ValueError("引用标识不能为空白字符串")
+        return value
+
+    @field_validator("use")
+    @classmethod
+    def _use_non_blank(cls, value: str) -> str:
         value = value.strip()
         if not value:
-            raise ValueError("字段不能为空白字符串")
+            raise ValueError("用途不能为空白字符串")
         return value
 
 
@@ -297,7 +317,12 @@ class AdmissionResolution(BaseModel):
     """
 
     kind: Literal["version", "slot"]
-    ref: str = Field(description="提交的版本标识或槽名（去空格）")
+    ref: str = Field(
+        description=(
+            "实际引用标识：版本条目 verbatim_ref=true 时为含首尾空格的已登记原样标识，"
+            "其余情形（含全部槽条目）为去首尾空格后的标识"
+        )
+    )
     version_id: str | None = Field(
         default=None, description="解析目标版本；该分段槽未发布时为 null"
     )
@@ -339,8 +364,16 @@ class AdmissionEntryResult(BaseModel):
 
     position: int = Field(description="该条在请求清单中的从 0 起序号")
     kind: Literal["version", "slot"]
-    ref: str
+    ref: str = Field(
+        description=(
+            "实际引用标识：版本条目 verbatim_ref=true 时保留首尾空格按原样引用，"
+            "其余情形（含全部槽条目）为去首尾空格后的标识"
+        )
+    )
     use: str = Field(description="去首尾空格后的用途")
+    verbatim_ref: bool = Field(
+        description="该条是否按原样引用已登记版本标识；槽条目恒为 false"
+    )
     resolution: AdmissionResolution = Field(
         description="窗口起点处的解析指针（槽在起点未发布时为无目标指针）"
     )
@@ -372,8 +405,15 @@ class AdmissionFailure(BaseModel):
 
     position: int
     kind: Literal["version", "slot"]
-    ref: str
+    ref: str = Field(
+        description=(
+            "实际引用标识：版本条目原样引用时保留首尾空格，其余为去空格标识"
+        )
+    )
     use: str
+    verbatim_ref: bool = Field(
+        description="该条是否按原样引用已登记版本标识；槽条目恒为 false"
+    )
     failure_start: datetime = Field(description="首个失败时段起点（含，UTC）")
     failure_end: datetime = Field(description="首个失败时段终点（不含，UTC）")
     reason: Literal[

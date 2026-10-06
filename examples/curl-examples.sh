@@ -376,6 +376,42 @@ curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' 
     ]
   }'; echo
 
+say "交付准入原样引用（本轮新增）：登记标识本身含首尾空格的版本，再按原样精确引用"
+# 版本登记保留标识首尾空格；给该含空格标识登记 research 许可（调用均幂等，可重复运行）
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
+  -d '{"version_id":" example-spaced ","parent_ids":[],"note":"标识含首尾空格"}' >/dev/null
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"example-spaced-c1","version_id":" example-spaced ","effective_at":"2026-01-01T00:00:00Z","allowed_uses":["research"]}' >/dev/null
+# 另一个不带空格的 example-spaced 不登记许可：若误裁空格引用到它，会 403 no_valid_license
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
+  -d '{"version_id":"example-spaced","parent_ids":[],"note":"不含空格的另一版本"}' >/dev/null
+# verbatim_ref=true：按 " example-spaced " 原样匹配 -> 201，记录中 ref 含空格、verbatim_ref=true
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{
+    "delivery_id": "example-delivery-verbatim",
+    "start": "2026-08-01T00:00:00Z",
+    "end": "2026-12-01T00:00:00Z",
+    "entries": [
+      {"kind": "version", "ref": " example-spaced ", "use": "research", "verbatim_ref": true}
+    ]
+  }'; echo
+# 同交付号、同引用方式与实际标识重试 -> 200 replayed=true（用途空格差异不影响）
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-verbatim","start":"2026-08-01T00:00:00Z","end":"2026-12-01T00:00:00Z",
+       "entries":[{"kind":"version","ref":" example-spaced ","use":" research ","verbatim_ref":true}]}'; echo
+# 同交付号但去掉 verbatim_ref -> 实际标识变为 example-spaced（无许可）：内容不同 -> 409，不改原记录
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-verbatim","start":"2026-08-01T00:00:00Z","end":"2026-12-01T00:00:00Z",
+       "entries":[{"kind":"version","ref":" example-spaced ","use":"research"}]}'; echo
+# 原样引用一个未登记的含空格标识 -> 404（绝不裁空格猜测）
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-verbatim-404","start":"2026-08-01T00:00:00Z","end":"2026-12-01T00:00:00Z",
+       "entries":[{"kind":"version","ref":" no-such-spaced ","use":"research","verbatim_ref":true}]}'; echo
+# 槽条目即使带 verbatim_ref=true 也仍按去空格槽名解析（标记不生效，回显 false）
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-slot-flag","start":"2026-08-01T00:00:00Z","end":"2026-12-01T00:00:00Z",
+       "entries":[{"kind":"slot","ref":" prod ","use":"research","verbatim_ref":true}]}'; echo
+
 say "交付准入追溯：按交付号取回首次固化记录（之后目录变化不改写它）"
 curl -s "$BASE/delivery-admissions/example-delivery-1"; echo
 

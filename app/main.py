@@ -399,7 +399,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             },
             404: {"description": "条目引用了未知版本，整单拒绝且不落库"},
             409: {"description": "交付号复用到不同窗口或不同清单内容"},
-            422: {"description": "条目为空、时刻无时区、空/倒置窗口、空白用途或空白引用"},
+            422: {
+                "description": (
+                    "条目为空、时刻无时区、空/倒置窗口、空白用途或空白引用；"
+                    "版本条目可显式 verbatim_ref=true 按原样引用含首尾空格的已登记标识"
+                )
+            },
         },
     )
     def submit_delivery_admission(

@@ -407,10 +407,13 @@ def admission_content_hash(
     """Stable hash of an admission request's window and ordered entry list.
 
     A retry is identical only when the window converts to the same UTC
-    instants and the ordered entries match after normalisation: trimmed
-    slot/use/delivery references, the explicit ``version``/``slot`` kind and
-    the same trimmed use. Request ORDER is part of the content (the entries are
-    an ordered manifest).
+    instants and the ordered entries match after normalisation: the explicit
+    ``version``/``slot`` kind, the same trimmed use, the reference actually
+    quoted (a version entry with ``verbatim_ref`` keeps the registered id
+    verbatim including surrounding spaces; every slot reference and a
+    non-verbatim version reference are trimmed) AND the same quoting mode.
+    Request ORDER is part of the content (the entries are an ordered
+    manifest), so two entries differing only by position never collide.
     """
     payload = {
         "start": start_value,
@@ -421,12 +424,59 @@ def admission_content_hash(
                 "kind": entry["kind"],
                 "ref": entry["ref"],
                 "use": entry["use"],
+                "verbatim_ref": bool(entry["verbatim_ref"]),
             }
             for entry in entries
         ],
     }
     blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def _admission_same_request(
+    row: dict[str, Any],
+    digest: str,
+    start_c: str,
+    end_c: str,
+    entries: list[dict[str, Any]],
+) -> bool:
+    """Whether a stored admission replays for this request.
+
+    The content hash is the fast, complete equality check for records frozen
+    under the current scheme. Records frozen BEFORE verbatim quoting existed
+    carry a hash computed without the ``verbatim_ref`` term, so a same-input
+    retry now produces a different digest; for those we fall back to a
+    semantic comparison against the frozen snapshot (window instants plus the
+    ordered kind/actual-ref/use/quoting-mode list, with the absent flag read
+    as the legacy trimmed rule). This keeps the original replay result for
+    already-frozen records while every genuinely different input still
+    conflicts.
+    """
+    if row.get("content_hash") == digest:
+        return True
+    try:
+        frozen = json.loads(row["result_json"])
+    except (ValueError, TypeError):
+        return False
+    if frozen.get("start") != start_c or frozen.get("end") != end_c:
+        return False
+    stored_entries = frozen.get("entries")
+    if not isinstance(stored_entries, list) or len(stored_entries) != len(entries):
+        return False
+    for stored, current in zip(stored_entries, entries):
+        if not isinstance(stored, dict):
+            return False
+        if stored.get("position") != current["position"]:
+            return False
+        if stored.get("kind") != current["kind"]:
+            return False
+        if stored.get("ref") != current["ref"]:
+            return False
+        if stored.get("use") != current["use"]:
+            return False
+        if bool(stored.get("verbatim_ref", False)) is not bool(current["verbatim_ref"]):
+            return False
+    return True
 
 
 def _freeze_admission_result(result: dict[str, Any]) -> str:
@@ -448,6 +498,7 @@ def _freeze_admission_result(result: dict[str, Any]) -> str:
                 "kind": entry["kind"],
                 "ref": entry["ref"],
                 "use": entry["use"],
+                "verbatim_ref": bool(entry.get("verbatim_ref", False)),
                 "resolution": _freeze_admission_resolution(entry["resolution"]),
                 "segments": [
                     _freeze_admission_segment(segment)
@@ -510,6 +561,9 @@ def _thaw_admission_result(blob: str) -> dict[str, Any]:
                 "kind": entry["kind"],
                 "ref": entry["ref"],
                 "use": entry["use"],
+                # Records frozen before verbatim quoting existed carry no flag:
+                # they always used the trimmed-reference rule.
+                "verbatim_ref": bool(entry.get("verbatim_ref", False)),
                 "resolution": _thaw_admission_resolution(entry["resolution"]),
                 "segments": [
                     _thaw_admission_segment(segment) for segment in entry["segments"]
@@ -565,6 +619,7 @@ def _admission_failure_from_segment(
         "kind": entry["kind"],
         "ref": entry["ref"],
         "use": entry["use"],
+        "verbatim_ref": bool(entry.get("verbatim_ref", False)),
         "failure_start": segment["start"],
         "failure_end": segment["end"],
         "reason": blockers[0]["reason"] if blockers else "not_allowed",
@@ -2072,8 +2127,16 @@ class LicenseService:
         """Atomically admit a whole delivery manifest over its usage window.
 
         Each entry references either a registered ``version`` or a version
-        ``slot`` and states one trimmed intended use. Slot references follow
-        the slot's published re-points within the half-open window
+        ``slot`` and states one trimmed intended use. A version entry may
+        explicitly opt into verbatim quoting (``verbatim_ref=True``): the
+        submitted reference is then matched against the registered version id
+        AS-IS, including any leading/trailing whitespace (version registration
+        preserves them), so a registered ``" v "`` is never mistaken for an
+        unknown version or for ``"v"``. Without that opt-in the existing
+        trimming rule still applies to both kinds; slot entries are always
+        trimmed (slot names are registered trimmed) even if the flag is sent,
+        and an all-whitespace reference is always rejected. Slot references
+        follow the slot's published re-points within the half-open window
         ``[start, end)`` — the target version is resolved per segment against
         the SAME database snapshot — and the resolved version is then judged
         with the existing ancestor/intersection/license/revocation rules for
@@ -2088,10 +2151,12 @@ class LicenseService:
         and NOTHING is persisted.
 
         A retry with the same delivery id and an identical normalised input
-        (trimmed refs/uses, UTC instants, same order) returns the frozen first
-        result; the same id with different content is a conflict. Unknown
-        versions, naive times, an empty window or blank uses are rejected
-        before any row is written.
+        (same quoting mode, actual quoted id, trimmed uses, UTC instants and
+        the same entry order) returns the frozen first result; the same id with
+        different content — including toggling verbatim quoting, which changes
+        the actual referenced id — is a conflict. Unknown versions, naive
+        times, an empty window or blank uses are rejected before any row is
+        written.
         """
         if not isinstance(start, datetime) or start.tzinfo is None:
             raise InvalidTimeError("使用窗口起点必须带时区信息")
@@ -2120,8 +2185,8 @@ class LicenseService:
                     f"第 {pos} 条条目的引用类型必须是 version 或 slot",
                     {"index": str(pos)},
                 )
-            ref = str(item["ref"]).strip()
-            if not ref:
+            raw_ref = str(item["ref"])
+            if not raw_ref.strip():
                 raise ServiceError(
                     f"第 {pos} 条条目的引用标识不能为空", {"index": str(pos)}
                 )
@@ -2130,8 +2195,21 @@ class LicenseService:
                 raise ServiceError(
                     f"第 {pos} 条条目的用途不能为空", {"index": str(pos)}
                 )
+            # Verbatim quoting is an explicit, version-only opt-in: version
+            # registration preserves surrounding spaces in the id, so the
+            # quoted id is looked up as submitted. Slot names are registered
+            # trimmed, therefore slot entries always follow the trimming rule
+            # and a stray flag is silently treated as false.
+            verbatim = kind == "version" and bool(item.get("verbatim_ref", False))
+            ref = raw_ref if verbatim else raw_ref.strip()
             normalised.append(
-                {"position": pos, "kind": kind, "ref": ref, "use": use}
+                {
+                    "position": pos,
+                    "kind": kind,
+                    "ref": ref,
+                    "use": use,
+                    "verbatim_ref": verbatim,
+                }
             )
 
         digest = admission_content_hash(start_c, end_c, normalised)
@@ -2139,7 +2217,9 @@ class LicenseService:
         with self.db.lock:
             existing = self.db.get_delivery_admission(delivery_id)
             if existing is not None:
-                if existing["content_hash"] != digest:
+                if not _admission_same_request(
+                    existing, digest, start_c, end_c, normalised
+                ):
                     raise ConflictError(
                         "同一交付标识已存在但窗口或条目内容不同（交付标识不可复用指向不同清单）",
                         {"delivery_id": delivery_id},
@@ -2170,7 +2250,9 @@ class LicenseService:
                 self.db.begin()
                 raced = self.db.get_delivery_admission(delivery_id)
                 if raced is not None:
-                    if raced["content_hash"] != digest:
+                    if not _admission_same_request(
+                        raced, digest, start_c, end_c, normalised
+                    ):
                         raise ConflictError(
                             "同一交付标识已存在但窗口或条目内容不同（交付标识不可复用指向不同清单）",
                             {"delivery_id": delivery_id},
@@ -2228,7 +2310,9 @@ class LicenseService:
                 # A concurrent first-writer may have won the delivery id.
                 raced = self.db.get_delivery_admission(delivery_id)
                 if raced is not None:
-                    if raced["content_hash"] == digest:
+                    if _admission_same_request(
+                        raced, digest, start_c, end_c, normalised
+                    ):
                         return _thaw_admission_result(raced["result_json"]), True
                     raise ConflictError(
                         "同一交付标识已存在但窗口或条目内容不同（交付标识不可复用指向不同清单）",
