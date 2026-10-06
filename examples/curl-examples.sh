@@ -415,6 +415,43 @@ curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' 
 curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
   -d '{"delivery_id":"example-delivery-bad4","start":"2026-08-01T00:00:00Z","end":"2026-12-01T00:00:00Z","entries":[]}'; echo
 
+say "原样引用：登记标识本身带首尾空格的版本（版本登记保留空格）"
+curl -s -X POST "$BASE/versions" -H 'Content-Type: application/json' \
+  -d '{"version_id": " v ", "note": "标识含首尾空格的示例版本"}'; echo
+curl -s -X POST "$BASE/license-changes" -H 'Content-Type: application/json' \
+  -d '{"change_id":"example-chg-spaced-v","version_id":" v ","effective_at":"2026-01-01T00:00:00Z","allowed_uses":["research"]}'; echo
+
+say "原样引用：默认裁空格把 \" v \" 裁成 \"v\" -> 404 误报未知版本（或错判成另一个已登记的 v）"
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-trim","start":"2026-08-01T00:00:00Z","end":"2026-12-01T00:00:00Z",
+       "entries":[{"kind":"version","ref":" v ","use":"research"}]}'; echo
+
+say "原样引用：版本条目显式 exact_ref=true -> 按原样命中 \" v \"，201 固化（entry.exact_ref=true）"
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-exact","start":"2026-08-01T00:00:00Z","end":"2026-12-01T00:00:00Z",
+       "entries":[{"kind":"version","ref":" v ","use":"research","exact_ref":true}]}'; echo
+
+say "原样引用重试：同交付号 + 同引用方式 + 同原样标识（用途/时刻归一化）-> 200 replayed=true"
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-exact","start":"2026-08-01T08:00:00+08:00","end":"2026-12-01T08:00:00+08:00",
+       "entries":[{"kind":"version","ref":" v ","use":" research ","exact_ref":true}]}'; echo
+
+say "原样引用冲突：同交付号但引用方式不同（去掉 exact_ref）或空格数量不同 -> 409"
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-exact","start":"2026-08-01T00:00:00Z","end":"2026-12-01T00:00:00Z",
+       "entries":[{"kind":"version","ref":" v ","use":"research"}]}'; echo
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-exact","start":"2026-08-01T00:00:00Z","end":"2026-12-01T00:00:00Z",
+       "entries":[{"kind":"version","ref":"  v ","use":"research","exact_ref":true}]}'; echo
+
+say "原样引用校验：原样模式下空白引用仍 422；槽条目误传 exact_ref 也 422"
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-bad5","start":"2026-08-01T00:00:00Z","end":"2026-12-01T00:00:00Z",
+       "entries":[{"kind":"version","ref":"   ","use":"research","exact_ref":true}]}'; echo
+curl -s -X POST "$BASE/delivery-admissions" -H 'Content-Type: application/json' \
+  -d '{"delivery_id":"example-delivery-bad6","start":"2026-08-01T00:00:00Z","end":"2026-12-01T00:00:00Z",
+       "entries":[{"kind":"slot","ref":"prod","use":"research","exact_ref":true}]}'; echo
+
 say "证明包：首次导出 example-voucher-1 -> 201（签名并原子固化）"
 curl -s -X POST "$BASE/permissions/vouchers/example-voucher-1/proof"; echo
 

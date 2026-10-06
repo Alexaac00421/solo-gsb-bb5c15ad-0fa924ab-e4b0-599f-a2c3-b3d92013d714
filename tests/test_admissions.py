@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 from datetime import datetime, timezone
 
@@ -77,6 +79,10 @@ def _admit(client, delivery_id, start, end, entries, **extra):
 
 def _entry(kind, ref, use):
     return {"kind": kind, "ref": ref, "use": use}
+
+
+def _entry_exact(ref, use, kind="version"):
+    return {"kind": kind, "ref": ref, "use": use, "exact_ref": True}
 
 
 def _setup_chain(client):
@@ -744,3 +750,269 @@ def test_admission_evaluated_against_single_snapshot(client):
     entries = resp.json()["admission"]["entries"]
     assert entries[0]["segments"][0]["resolution"]["version_id"] == "v1"
     assert entries[1]["segments"][0]["version_id"] == "v2"
+
+
+# -- verbatim (exact_ref) version references --------------------------------
+
+
+def test_spaced_version_id_is_unknown_under_default_trim_but_hit_verbatim(client):
+    # Registration keeps the surrounding spaces; the default trim rule would
+    # misreport the entry as an unknown version.
+    _version(client, " v ")
+    _change(client, "c1", " v ", _iso(2026, 1, 1), ["research"])
+    trimmed = _admit(
+        client, "del-1", _iso(2026, 2, 1), _iso(2026, 8, 1),
+        [_entry("version", " v ", "research")],
+    )
+    assert trimmed.status_code == 404
+    assert trimmed.json()["details"]["missing_version_ids"] == "v"
+
+    exact = _admit(
+        client, "del-2", _iso(2026, 2, 1), _iso(2026, 8, 1),
+        [_entry_exact(" v ", "research")],
+    )
+    assert exact.status_code == 201, exact.text
+    entry = exact.json()["admission"]["entries"][0]
+    assert entry["ref"] == " v "
+    assert entry["exact_ref"] is True
+    assert entry["resolution"]["ref"] == " v "
+    assert entry["resolution"]["version_id"] == " v "
+    segment = entry["segments"][0]
+    assert segment["allowed"] is True
+    assert segment["version_id"] == " v "
+    assert segment["closure"] == [" v "]
+    assert segment["basis"][0]["change_id"] == "c1"
+    assert segment["resolution"]["version_id"] == " v "
+
+
+def test_trim_mode_resolves_to_the_other_registered_version(client):
+    # "v" and " v " are two distinct registered versions: the trim rule judges
+    # "v" while the verbatim reference judges " v ".
+    _version(client, "v")
+    _version(client, " v ")
+    _change(client, "c-plain", "v", _iso(2026, 1, 1), ["research"])
+    _change(client, "c-spaced", " v ", _iso(2026, 1, 1), ["research"])
+    resp = _admit(
+        client, "del-1", _iso(2026, 2, 1), _iso(2026, 8, 1),
+        [_entry("version", " v ", "research")],
+    )
+    assert resp.status_code == 201, resp.text
+    entry = resp.json()["admission"]["entries"][0]
+    assert entry["ref"] == "v"
+    assert entry["exact_ref"] is False
+    assert entry["segments"][0]["version_id"] == "v"
+    assert entry["segments"][0]["basis"][0]["change_id"] == "c-plain"
+
+
+def test_verbatim_reference_changes_whole_window_judgement(client):
+    _version(client, "v")
+    _version(client, " v ")
+    _change(client, "c-plain", "v", _iso(2026, 1, 1), ["review"])  # no research
+    _change(client, "c-spaced", " v ", _iso(2026, 1, 1), ["research"])
+    trimmed = _admit(
+        client, "del-trim", _iso(2026, 2, 1), _iso(2026, 8, 1),
+        [_entry("version", " v ", "research")],
+    )
+    assert trimmed.status_code == 403
+    assert trimmed.json()["failures"][0]["blockers"][0]["version_id"] == "v"
+    exact = _admit(
+        client, "del-exact", _iso(2026, 2, 1), _iso(2026, 8, 1),
+        [_entry_exact(" v ", "research")],
+    )
+    assert exact.status_code == 201, exact.text
+
+
+def test_failure_details_keep_the_verbatim_reference(client):
+    _version(client, " v ")  # registered but never licensed
+    resp = _admit(
+        client, "del-1", _iso(2026, 2, 1), _iso(2026, 8, 1),
+        [_entry_exact(" v ", "research")],
+    )
+    assert resp.status_code == 403
+    failure = resp.json()["failures"][0]
+    assert failure["ref"] == " v "
+    assert failure["exact_ref"] is True
+    assert failure["reason"] == "no_valid_license"
+    assert failure["blockers"][0]["version_id"] == " v "
+    # A denial persists nothing.
+    assert client.get("/delivery-admissions/del-1").status_code == 404
+
+
+def test_blank_ref_is_422_even_in_verbatim_mode(client):
+    resp = _admit(
+        client, "del-x", _iso(2026, 2, 1), _iso(2026, 8, 1),
+        [_entry_exact("   ", "research")],
+    )
+    assert resp.status_code == 422
+
+
+def test_exact_ref_on_a_slot_entry_is_422(client):
+    resp = _admit(
+        client, "del-x", _iso(2026, 2, 1), _iso(2026, 8, 1),
+        [_entry_exact("prod", "research", kind="slot")],
+    )
+    assert resp.status_code == 422
+
+
+def test_mixed_verbatim_version_and_trimmed_slot_entries(client):
+    _setup_chain(client)
+    _version(client, " v ")
+    _change(client, "c1", " v ", _iso(2026, 1, 1), ["research"])
+    _publish(client, "rel-1", _iso(2026, 3, 1), "prod", "v1", 0)
+    resp = _admit(
+        client, "del-1", _iso(2026, 3, 1), _iso(2026, 8, 1),
+        [_entry_exact(" v ", "research"), _entry("slot", " prod ", "research")],
+    )
+    assert resp.status_code == 201, resp.text
+    entries = resp.json()["admission"]["entries"]
+    assert entries[0]["exact_ref"] is True
+    assert entries[0]["ref"] == " v "
+    assert entries[1]["exact_ref"] is False
+    assert entries[1]["ref"] == "prod"
+
+
+def test_verbatim_record_replays_only_for_same_mode_and_identical_ref(client):
+    _version(client, " v ")
+    _change(client, "c1", " v ", _iso(2026, 1, 1), ["research"])
+    first = _admit(
+        client, "del-1", _iso(2026, 2, 1), _iso(2026, 8, 1),
+        [_entry_exact(" v ", "research")],
+    )
+    assert first.status_code == 201
+    # Same mode + same as-is identifier (use/window normalised) -> replay.
+    retry = _admit(
+        client, "del-1", "2026-02-01T08:00:00+08:00", "2026-08-01T08:00:00+08:00",
+        [_entry_exact(" v ", " research ")],
+    )
+    assert retry.status_code == 200
+    assert retry.json()["replayed"] is True
+    assert retry.json()["admission"] == first.json()["admission"]
+    # Different spacing on the verbatim identifier -> different input -> 409.
+    resp = _admit(
+        client, "del-1", _iso(2026, 2, 1), _iso(2026, 8, 1),
+        [_entry_exact("  v ", "research")],
+    )
+    assert resp.status_code == 409
+    # Same identifier without the verbatim mode -> mode differs -> 409.
+    resp = _admit(
+        client, "del-1", _iso(2026, 2, 1), _iso(2026, 8, 1),
+        [_entry("version", " v ", "research")],
+    )
+    assert resp.status_code == 409
+
+
+def test_same_identifier_in_different_modes_conflicts(client):
+    _version(client, "v")
+    _change(client, "c1", "v", _iso(2026, 1, 1), ["research"])
+    first = _admit(
+        client, "del-1", _iso(2026, 2, 1), _iso(2026, 8, 1),
+        [_entry("version", "v", "research")],
+    )
+    assert first.status_code == 201
+    # The reference mode is part of the delivery id's identity even when the
+    # identifier itself carries no spaces.
+    resp = _admit(
+        client, "del-1", _iso(2026, 2, 1), _iso(2026, 8, 1),
+        [_entry_exact("v", "research")],
+    )
+    assert resp.status_code == 409
+
+
+def test_frozen_verbatim_record_is_queryable_and_immutable(client):
+    _version(client, " v ")
+    _change(client, "c1", " v ", _iso(2026, 1, 1), ["research"])
+    first = _admit(
+        client, "del-1", _iso(2026, 2, 1), _iso(2026, 8, 1),
+        [_entry_exact(" v ", "research")],
+    )
+    assert first.status_code == 201
+    # Later catalog changes do not rewrite the frozen verbatim record.
+    _change(client, "c2", " v ", _iso(2026, 5, 1), ["review"])
+    got = client.get("/delivery-admissions/del-1")
+    assert got.status_code == 200
+    assert got.json() == first.json()["admission"]
+    entry = got.json()["entries"][0]
+    assert entry["ref"] == " v "
+    assert entry["exact_ref"] is True
+    assert entry["segments"][0]["resolution"]["ref"] == " v "
+    assert entry["segments"][0]["version_id"] == " v "
+
+
+def test_pre_feature_frozen_record_keeps_original_replay(client):
+    # Simulate a record frozen before exact_ref existed: its content hash was
+    # computed without the reference-mode marker and its frozen JSON carries
+    # no exact_ref keys. It must stay queryable and replayable verbatim.
+    _version(client, "a")
+    _change(client, "c1", "a", _iso(2026, 1, 1), ["research"])
+    start_c = "2026-02-01T00:00:00.000000Z"
+    end_c = "2026-08-01T00:00:00.000000Z"
+    legacy_payload = {
+        "start": start_c,
+        "end": end_c,
+        "entries": [
+            {"position": 0, "kind": "version", "ref": "a", "use": "research"}
+        ],
+    }
+    legacy_digest = hashlib.sha256(
+        json.dumps(
+            legacy_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+    resolution = {
+        "kind": "version",
+        "ref": "a",
+        "version_id": "a",
+        "release_id": None,
+        "revision": None,
+        "effective_at": start_c,
+    }
+    legacy_result = {
+        "delivery_id": "legacy-1",
+        "created_at": "2026-01-15T00:00:00.000000Z",
+        "start": start_c,
+        "end": end_c,
+        "entry_count": 1,
+        "entries": [
+            {
+                "position": 0,
+                "kind": "version",
+                "ref": "a",
+                "use": "research",
+                "resolution": resolution,
+                "segments": [
+                    {
+                        "start": start_c,
+                        "end": end_c,
+                        "allowed": True,
+                        "resolution": resolution,
+                        "version_id": "a",
+                        "closure": ["a"],
+                        "basis": [],
+                        "blockers": [],
+                        "allowed_uses_intersection": ["research"],
+                    }
+                ],
+            }
+        ],
+    }
+    db = client.app.state.app_state.db
+    db.insert_delivery_admission(
+        delivery_id="legacy-1",
+        content_hash=legacy_digest,
+        start_value=start_c,
+        end_value=end_c,
+        created_at="2026-01-15T00:00:00.000000Z",
+        result_json=json.dumps(legacy_result, ensure_ascii=False, sort_keys=True),
+    )
+    # GET returns the frozen record; the response defaults exact_ref to false.
+    got = client.get("/delivery-admissions/legacy-1")
+    assert got.status_code == 200
+    assert got.json()["entries"][0]["exact_ref"] is False
+    # An identical trim-mode retry still replays the original record.
+    retry = _admit(
+        client, "legacy-1", _iso(2026, 2, 1), _iso(2026, 8, 1),
+        [_entry("version", " a ", " research ")],
+    )
+    assert retry.status_code == 200
+    assert retry.json()["replayed"] is True
+    assert retry.json()["admission"] == got.json()

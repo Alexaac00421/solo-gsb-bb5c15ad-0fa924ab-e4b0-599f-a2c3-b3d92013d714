@@ -408,22 +408,33 @@ def admission_content_hash(
 
     A retry is identical only when the window converts to the same UTC
     instants and the ordered entries match after normalisation: trimmed
-    slot/use/delivery references, the explicit ``version``/``slot`` kind and
-    the same trimmed use. Request ORDER is part of the content (the entries are
-    an ordered manifest).
+    slot/use/delivery references, the explicit ``version``/``slot`` kind, the
+    same trimmed use and the same reference MODE (verbatim vs trimmed). A
+    verbatim (``exact_ref``) version entry keeps its identifier exactly as
+    submitted, so ``" v "`` and ``"v"`` hash differently, and the same
+    identifier submitted in a different mode hashes differently too. Request
+    ORDER is part of the content (the entries are an ordered manifest).
+
+    The mode marker is only emitted for verbatim entries: records frozen
+    before the mode existed carry a hash computed without it, and a trimmed
+    (default) entry must keep producing that very hash so old records stay
+    replayable.
     """
+    normalised_entries: list[dict[str, Any]] = []
+    for entry in entries:
+        payload_entry: dict[str, Any] = {
+            "position": entry["position"],
+            "kind": entry["kind"],
+            "ref": entry["ref"],
+            "use": entry["use"],
+        }
+        if entry.get("exact_ref"):
+            payload_entry["exact_ref"] = True
+        normalised_entries.append(payload_entry)
     payload = {
         "start": start_value,
         "end": end_value,
-        "entries": [
-            {
-                "position": entry["position"],
-                "kind": entry["kind"],
-                "ref": entry["ref"],
-                "use": entry["use"],
-            }
-            for entry in entries
-        ],
+        "entries": normalised_entries,
     }
     blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -448,6 +459,7 @@ def _freeze_admission_result(result: dict[str, Any]) -> str:
                 "kind": entry["kind"],
                 "ref": entry["ref"],
                 "use": entry["use"],
+                "exact_ref": bool(entry.get("exact_ref", False)),
                 "resolution": _freeze_admission_resolution(entry["resolution"]),
                 "segments": [
                     _freeze_admission_segment(segment)
@@ -510,6 +522,9 @@ def _thaw_admission_result(blob: str) -> dict[str, Any]:
                 "kind": entry["kind"],
                 "ref": entry["ref"],
                 "use": entry["use"],
+                # Records frozen before the reference mode existed have no
+                # exact_ref key; they were all frozen under the trim rule.
+                "exact_ref": bool(entry.get("exact_ref", False)),
                 "resolution": _thaw_admission_resolution(entry["resolution"]),
                 "segments": [
                     _thaw_admission_segment(segment) for segment in entry["segments"]
@@ -565,6 +580,7 @@ def _admission_failure_from_segment(
         "kind": entry["kind"],
         "ref": entry["ref"],
         "use": entry["use"],
+        "exact_ref": bool(entry.get("exact_ref", False)),
         "failure_start": segment["start"],
         "failure_end": segment["end"],
         "reason": blockers[0]["reason"] if blockers else "not_allowed",
@@ -2072,8 +2088,16 @@ class LicenseService:
         """Atomically admit a whole delivery manifest over its usage window.
 
         Each entry references either a registered ``version`` or a version
-        ``slot`` and states one trimmed intended use. Slot references follow
-        the slot's published re-points within the half-open window
+        ``slot`` and states one trimmed intended use. A version entry may
+        explicitly opt into a VERBATIM reference (``exact_ref``): the
+        identifier is then used exactly as submitted — leading/trailing
+        spaces included — for the unknown-version check, the whole-window
+        permission evaluation, the failure details and the frozen record, so
+        a registered id like ``" v "`` is hit precisely instead of being
+        trimmed into a missing or different version. Without the flag the
+        existing trim rule applies; slot entries always trim. A blank
+        reference is rejected in every mode. Slot references follow the
+        slot's published re-points within the half-open window
         ``[start, end)`` — the target version is resolved per segment against
         the SAME database snapshot — and the resolved version is then judged
         with the existing ancestor/intersection/license/revocation rules for
@@ -2088,8 +2112,9 @@ class LicenseService:
         and NOTHING is persisted.
 
         A retry with the same delivery id and an identical normalised input
-        (trimmed refs/uses, UTC instants, same order) returns the frozen first
-        result; the same id with different content is a conflict. Unknown
+        (same reference mode, same actual identifiers, trimmed uses, UTC
+        instants, same order) returns the frozen first result; the same id
+        with different content is a conflict. Unknown
         versions, naive times, an empty window or blank uses are rejected
         before any row is written.
         """
@@ -2120,7 +2145,29 @@ class LicenseService:
                     f"第 {pos} 条条目的引用类型必须是 version 或 slot",
                     {"index": str(pos)},
                 )
-            ref = str(item["ref"]).strip()
+            exact_ref = bool(item.get("exact_ref", False))
+            raw_ref = str(item["ref"])
+            if kind == "slot":
+                if exact_ref:
+                    # Verbatim references exist only for version entries;
+                    # slot names always follow the trim rule.
+                    raise ServiceError(
+                        f"第 {pos} 条条目为槽引用，不支持原样引用（exact_ref）",
+                        {"index": str(pos)},
+                    )
+                ref = raw_ref.strip()
+            elif exact_ref:
+                # Verbatim mode: the registered identifier is referenced
+                # exactly as submitted — leading/trailing spaces are
+                # significant and must survive into evaluation, failure
+                # details and the frozen record.
+                ref = raw_ref
+                if not ref.strip():
+                    raise ServiceError(
+                        f"第 {pos} 条条目的引用标识不能为空", {"index": str(pos)}
+                    )
+            else:
+                ref = raw_ref.strip()
             if not ref:
                 raise ServiceError(
                     f"第 {pos} 条条目的引用标识不能为空", {"index": str(pos)}
@@ -2131,7 +2178,13 @@ class LicenseService:
                     f"第 {pos} 条条目的用途不能为空", {"index": str(pos)}
                 )
             normalised.append(
-                {"position": pos, "kind": kind, "ref": ref, "use": use}
+                {
+                    "position": pos,
+                    "kind": kind,
+                    "ref": ref,
+                    "use": use,
+                    "exact_ref": exact_ref,
+                }
             )
 
         digest = admission_content_hash(start_c, end_c, normalised)

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _ensure_aware(value: datetime) -> datetime:
@@ -231,19 +231,46 @@ class DeliveryAdmissionEntryRequest(BaseModel):
     ref: str = Field(
         min_length=1,
         description=(
-            "版本标识或槽名（去首尾空格后非空）；kind=version 时必须已登记，"
-            "kind=slot 时须在窗口起点前（含起点）已发布，否则该条失败"
+            "版本标识或槽名。默认去首尾空格后引用；kind=version 且 exact_ref=true 时"
+            "按原样引用（保留首尾空格，可命中本身带空格的已登记标识）。"
+            "任一模式下空白引用（空串或全空白）都拒绝"
         ),
     )
     use: str = Field(min_length=1, description="该条交付的拟使用用途（去首尾空格后判定与留痕）")
+    exact_ref: bool = Field(
+        default=False,
+        description=(
+            "仅 kind=version 时有效：true 表示 ref 按原样引用已登记版本标识"
+            "（保留首尾空格，不做裁切）；缺省 false 沿用去首尾空格规则。"
+            "槽条目始终去首尾空格，对槽条目传 true 拒绝"
+        ),
+    )
 
-    @field_validator("ref", "use")
+    @field_validator("use")
     @classmethod
-    def _non_blank(cls, value: str) -> str:
+    def _use_non_blank(cls, value: str) -> str:
         value = value.strip()
         if not value:
             raise ValueError("字段不能为空白字符串")
         return value
+
+    @model_validator(mode="after")
+    def _check_ref(self) -> "DeliveryAdmissionEntryRequest":
+        if self.kind == "slot":
+            if self.exact_ref:
+                raise ValueError("exact_ref 仅适用于 version 条目；槽条目始终去首尾空格")
+            self.ref = self.ref.strip()
+        elif self.exact_ref:
+            # Verbatim reference: the registered identifier is used exactly as
+            # submitted (leading/trailing spaces are significant); only a
+            # reference that is blank altogether is rejected.
+            if not self.ref.strip():
+                raise ValueError("ref 不能为空白字符串")
+        else:
+            self.ref = self.ref.strip()
+        if not self.ref:
+            raise ValueError("ref 不能为空白字符串")
+        return self
 
 
 class DeliveryAdmissionRequest(BaseModel):
@@ -297,7 +324,7 @@ class AdmissionResolution(BaseModel):
     """
 
     kind: Literal["version", "slot"]
-    ref: str = Field(description="提交的版本标识或槽名（去空格）")
+    ref: str = Field(description="提交的版本标识或槽名（版本条目选择原样引用时保留首尾空格）")
     version_id: str | None = Field(
         default=None, description="解析目标版本；该分段槽未发布时为 null"
     )
@@ -339,8 +366,12 @@ class AdmissionEntryResult(BaseModel):
 
     position: int = Field(description="该条在请求清单中的从 0 起序号")
     kind: Literal["version", "slot"]
-    ref: str
+    ref: str = Field(description="该条实际引用的标识（版本条目原样引用时保留首尾空格）")
     use: str = Field(description="去首尾空格后的用途")
+    exact_ref: bool = Field(
+        default=False,
+        description="该条是否按原样引用已登记版本标识（仅版本条目可为 true；早期固化的记录无此字段，读取时视为 false）",
+    )
     resolution: AdmissionResolution = Field(
         description="窗口起点处的解析指针（槽在起点未发布时为无目标指针）"
     )
@@ -372,8 +403,12 @@ class AdmissionFailure(BaseModel):
 
     position: int
     kind: Literal["version", "slot"]
-    ref: str
+    ref: str = Field(description="该条实际引用的标识（版本条目原样引用时保留首尾空格）")
     use: str
+    exact_ref: bool = Field(
+        default=False,
+        description="该条是否按原样引用已登记版本标识（仅版本条目可为 true）",
+    )
     failure_start: datetime = Field(description="首个失败时段起点（含，UTC）")
     failure_end: datetime = Field(description="首个失败时段终点（不含，UTC）")
     reason: Literal[

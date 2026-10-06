@@ -389,7 +389,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         tags=["delivery-admissions"],
         summary="判定整份交付清单在整个使用窗口内是否持续获准，并原子固化不可变准入记录",
         responses={
-            200: {"description": "同交付号与规范化后相同的有序输入重试，返回首次冻结的准入记录"},
+            200: {"description": "同交付号与规范化后相同的有序输入（含引用方式）重试，返回首次冻结的准入记录"},
             201: {"description": "全部条目全窗口允许：各条分段判定与准入记录在同一事务固化"},
             403: {
                 "description": (
@@ -398,8 +398,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             },
             404: {"description": "条目引用了未知版本，整单拒绝且不落库"},
-            409: {"description": "交付号复用到不同窗口或不同清单内容"},
-            422: {"description": "条目为空、时刻无时区、空/倒置窗口、空白用途或空白引用"},
+            409: {"description": "交付号复用到不同窗口、不同清单内容或不同引用方式"},
+            422: {"description": "条目为空、时刻无时区、空/倒置窗口、空白用途或空白引用、槽条目误用 exact_ref"},
         },
     )
     def submit_delivery_admission(
